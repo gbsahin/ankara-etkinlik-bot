@@ -1,3 +1,14 @@
+"""
+Ankara Events Bot — Enhanced Edition
+Features:
+  - Fuzzy deduplication (title similarity, not just URL)
+  - Skips image-less events in digest (quality over quantity)
+  - AI-written event summaries via Claude API
+  - Daily digest grouped by category (one message per category)
+  - Inline Telegram buttons: Get Tickets / Save Date
+  - Friday weekly top-picks edition (editorial AI pick of 3)
+"""
+
 import requests
 from bs4 import BeautifulSoup
 import os
@@ -5,18 +16,22 @@ import json
 import hashlib
 import time
 import signal
+import anthropic
 from datetime import datetime
+from difflib import SequenceMatcher
 
-# --- Config ---
-TOKEN = os.getenv('TELEGRAM_TOKEN')
-CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
+# ─────────────────────────────────────────
+# Config
+# ─────────────────────────────────────────
+TOKEN            = os.getenv('TELEGRAM_TOKEN')
+CHAT_ID          = os.getenv('TELEGRAM_CHAT_ID')
+ANTHROPIC_KEY    = os.getenv('ANTHROPIC_API_KEY')
 SEEN_EVENTS_FILE = "seen_events.json"
 
-# ✅ NEW: Hard cap on total runtime (seconds). Raise if you run on a slow server.
-MAX_RUN_SECONDS = 300  # 5 minutes total
-
-# ✅ NEW: Maximum OG image fetches per scraper run (Biletix was fetching one per event = huge delay)
-MAX_OG_FETCHES = 20
+MAX_RUN_SECONDS  = 360
+MAX_OG_FETCHES   = 25
+FUZZY_THRESHOLD  = 0.82   # titles this similar → treated as duplicate
+MAX_AI_SUMMARIES = 30     # cap Claude API calls per run
 
 HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
@@ -32,33 +47,43 @@ BILETIX_IGNORE_KEYWORDS = [
     'reklam', 'account'
 ]
 
+# Category keywords → bucket mapping
+CATEGORY_MAP = {
+    "🎵 Müzik / Konser": ["konser", "müzik", "music", "concert", "jazz", "rock", "pop",
+                           "klasik", "opera", "festival", "sahne", "gece"],
+    "🎭 Tiyatro & Gösteri": ["tiyatro", "theatre", "theater", "oyun", "gösteri",
+                              "stand-up", "comedy", "komedi", "dans", "bale"],
+    "🏛 Ücretsiz & Kültür": ["sergi", "exhibition", "müze", "museum", "kültür",
+                              "ücretsiz", "free", "açık", "festival", "ankara"],
+    "🎪 Diğer Etkinlikler": [],
+}
+
 SOURCE_STYLE = {
-    "Biletix":     {"icon": "🎟",  "label": "Biletix"},
-    "filAnkara":   {"icon": "📰",  "label": "filAnkara"},
-    "Eventbrite":  {"icon": "🌍",  "label": "Eventbrite"},
-    "Biletinial":  {"icon": "🎫",  "label": "Biletinial"},
-    "BiletimGO":   {"icon": "🎪",  "label": "BiletimGO"},
-    "Mobilet":     {"icon": "🎭",  "label": "Mobilet"},
-    "ABB":         {"icon": "🏛",  "label": "Ankara Büyükşehir"},
-    "LaKonser":    {"icon": "🎵",  "label": "LaKonser"},
+    "Biletix":    {"icon": "🎟", "label": "Biletix"},
+    "filAnkara":  {"icon": "📰", "label": "filAnkara"},
+    "Eventbrite": {"icon": "🌍", "label": "Eventbrite"},
+    "Biletinial": {"icon": "🎫", "label": "Biletinial"},
+    "BiletimGO":  {"icon": "🎪", "label": "BiletimGO"},
+    "Mobilet":    {"icon": "🎭", "label": "Mobilet"},
+    "ABB":        {"icon": "🏛", "label": "Ankara Büyükşehir"},
+    "LaKonser":   {"icon": "🎵", "label": "LaKonser"},
 }
 
 
-# ✅ NEW: Global timeout using SIGALRM (Linux/Mac only).
-# On Windows, use the threading-based fallback below instead.
-class TimeoutError(Exception):
+# ─────────────────────────────────────────
+# Timeout guard
+# ─────────────────────────────────────────
+class BotTimeoutError(Exception):
     pass
 
 def _timeout_handler(signum, frame):
-    raise TimeoutError("Bot exceeded maximum runtime limit.")
+    raise BotTimeoutError("Exceeded max runtime.")
 
 def set_global_timeout(seconds):
-    """Arms a hard kill-switch. Call once at the start of run_bot()."""
     try:
         signal.signal(signal.SIGALRM, _timeout_handler)
         signal.alarm(seconds)
     except AttributeError:
-        # SIGALRM not available on Windows — silently skip.
         pass
 
 def cancel_global_timeout():
@@ -68,7 +93,9 @@ def cancel_global_timeout():
         pass
 
 
-# --- Deduplication ---
+# ─────────────────────────────────────────
+# Deduplication — fuzzy + hash
+# ─────────────────────────────────────────
 def load_seen_events():
     if os.path.exists(SEEN_EVENTS_FILE):
         with open(SEEN_EVENTS_FILE, "r") as f:
@@ -82,16 +109,116 @@ def save_seen_events(seen):
 def event_hash(title, link):
     return hashlib.md5(f"{title}{link}".encode()).hexdigest()
 
+def _normalize(title):
+    import re
+    return re.sub(r'\s+', ' ', re.sub(r'[^\w\s]', '', title.lower())).strip()
 
-# --- Image fetcher ---
-# ✅ CHANGED: accepts a counter dict so callers can cap total fetches across the run
+def fuzzy_deduplicate(events):
+    """Remove events whose titles are suspiciously similar to an already-kept event."""
+    kept = []
+    kept_titles = []
+    for ev in events:
+        norm = _normalize(ev['title'])
+        duplicate = any(
+            SequenceMatcher(None, norm, kt).ratio() >= FUZZY_THRESHOLD
+            for kt in kept_titles
+        )
+        if not duplicate:
+            kept.append(ev)
+            kept_titles.append(norm)
+    return kept
+
+def url_deduplicate(events):
+    seen_links = set()
+    unique = []
+    for e in events:
+        if e['link'] not in seen_links:
+            seen_links.add(e['link'])
+            unique.append(e)
+    return unique
+
+
+# ─────────────────────────────────────────
+# Category classifier
+# ─────────────────────────────────────────
+def classify_event(title):
+    lower = title.lower()
+    for category, keywords in CATEGORY_MAP.items():
+        if any(kw in lower for kw in keywords):
+            return category
+    return "🎪 Diğer Etkinlikler"
+
+
+# ─────────────────────────────────────────
+# AI summary via Claude
+# ─────────────────────────────────────────
+def get_ai_summary(title, link, ai_counter):
+    if not ANTHROPIC_KEY:
+        return None
+    if ai_counter.get('count', 0) >= MAX_AI_SUMMARIES:
+        return None
+    ai_counter['count'] = ai_counter.get('count', 0) + 1
+    try:
+        client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
+        prompt = (
+            f"Etkinlik adı: {title}\n"
+            f"Link: {link}\n\n"
+            "Bu Ankara etkinliği için kısa, samimi ve merak uyandırıcı 1-2 cümlelik bir Türkçe açıklama yaz. "
+            "Neden gitmeye değer? Kitlesi kim? Öne çıkan özelliği ne? "
+            "Abartmadan, doğal bir dille yaz. Emoji kullanma. Sadece açıklama metnini döndür."
+        )
+        message = client.messages.create(
+            model="claude-opus-4-5",
+            max_tokens=120,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        summary = message.content[0].text.strip()
+        return summary if len(summary) > 10 else None
+    except Exception as e:
+        print(f"[AI Özet Hata] {e}")
+        return None
+
+
+# ─────────────────────────────────────────
+# AI weekly top picks
+# ─────────────────────────────────────────
+def get_weekly_top_picks(events):
+    if not ANTHROPIC_KEY or not events:
+        return []
+    try:
+        client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
+        event_list = "\n".join(
+            f"{i+1}. {e['title']} ({e['source']})" for i, e in enumerate(events[:40])
+        )
+        prompt = (
+            f"Aşağıda bu haftaki Ankara etkinlikleri listesi var:\n\n{event_list}\n\n"
+            "Bunlardan en ilgi çekici, en geniş kitleye hitap eden 3 tanesini seç. "
+            "Sadece seçtiğin etkinliklerin numaralarını virgülle döndür (örn: 3,7,12). "
+            "Başka hiçbir şey yazma."
+        )
+        message = client.messages.create(
+            model="claude-opus-4-5",
+            max_tokens=20,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        raw = message.content[0].text.strip()
+        indices = [int(x.strip()) - 1 for x in raw.split(',') if x.strip().isdigit()]
+        return [events[i] for i in indices if 0 <= i < len(events)]
+    except Exception as e:
+        print(f"[Top Picks Hata] {e}")
+        return []
+
+
+# ─────────────────────────────────────────
+# Image fetcher
+# ─────────────────────────────────────────
 def get_og_image(url, fetch_counter=None, max_fetches=MAX_OG_FETCHES):
     if fetch_counter is not None:
         if fetch_counter.get('count', 0) >= max_fetches:
             return None
         fetch_counter['count'] = fetch_counter.get('count', 0) + 1
     try:
-        res = requests.get(url, headers=HEADERS, timeout=6)  # ✅ reduced from 10s → 6s
+        res = requests.get(url, headers=HEADERS, timeout=6)
         if res.status_code != 200:
             return None
         soup = BeautifulSoup(res.text, 'html.parser')
@@ -110,29 +237,43 @@ def get_og_image(url, fetch_counter=None, max_fetches=MAX_OG_FETCHES):
     return None
 
 
-# --- Telegram ---
-def send_photo_message(image_url, caption):
+# ─────────────────────────────────────────
+# Telegram senders
+# ─────────────────────────────────────────
+def _inline_keyboard(link):
+    return {
+        "inline_keyboard": [[
+            {"text": "🎟 Bilet Al", "url": link},
+            {"text": "📅 Takvime Ekle", "callback_data": "save_date"},
+        ]]
+    }
+
+def send_photo_message(image_url, caption, reply_markup=None):
     url = f"https://api.telegram.org/bot{TOKEN}/sendPhoto"
     payload = {
         "chat_id": CHAT_ID,
         "photo": image_url,
         "caption": caption,
-        "parse_mode": "Markdown",
+        "parse_mode": "HTML",
     }
+    if reply_markup:
+        payload["reply_markup"] = json.dumps(reply_markup)
     try:
         r = requests.post(url, json=payload, timeout=15)
         return r.status_code == 200
     except Exception:
         return False
 
-def send_text_message(text):
+def send_text_message(text, reply_markup=None, disable_preview=True):
     url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
     payload = {
         "chat_id": CHAT_ID,
         "text": text,
-        "parse_mode": "Markdown",
-        "disable_web_page_preview": False,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": disable_preview,
     }
+    if reply_markup:
+        payload["reply_markup"] = json.dumps(reply_markup)
     try:
         r = requests.post(url, json=payload, timeout=10)
         if r.status_code != 200:
@@ -144,33 +285,83 @@ def send_text_message(text):
         return False
 
 def send_event(event):
-    title  = event['title']
-    link   = event['link']
-    source = event['source']
-    image  = event.get('image')
+    title   = event['title']
+    link    = event['link']
+    source  = event['source']
+    image   = event.get('image')
+    summary = event.get('summary', '')
 
     style = SOURCE_STYLE.get(source, {"icon": "📅", "label": source})
-    icon  = style['icon']
-    label = style['label']
+    summary_line = f"\n💬 <i>{summary}</i>\n" if summary else "\n"
 
     caption = (
-        f"{icon} *{title}*\n"
-        f"\n"
-        f"🔗 {link}\n"
-        f"━━━━━━━━━━━━━━━\n"
-        f"_{label} · Ankara_"
+        f"{style['icon']} <b>{title}</b>"
+        f"{summary_line}"
+        f"\n🔗 <a href='{link}'>Etkinlik Sayfası</a>"
+        f"\n<i>{style['label']} · Ankara</i>"
     )
 
+    markup = _inline_keyboard(link)
+
     if image:
-        success = send_photo_message(image, caption)
-        if success:
-            return True
+        return send_photo_message(image, caption, reply_markup=markup)
+    return False  # skip image-less events from digest
 
-    return send_text_message(caption)
+def send_digest_header(category, count):
+    today = datetime.now().strftime("%d %B %Y")
+    text = (
+        f"\n{category}\n"
+        f"<i>{today} · {count} etkinlik</i>\n"
+        f"{'─' * 20}"
+    )
+    send_text_message(text, disable_preview=True)
+
+def send_daily_intro():
+    today = datetime.now().strftime("%A, %d %B %Y")
+    is_friday = datetime.now().weekday() == 4
+    if is_friday:
+        header = "🏆 <b>Haftanın Öne Çıkanları</b>"
+        sub = "Bu haftanın en dikkat çekici Ankara etkinlikleri."
+    else:
+        header = "📍 <b>Ankara'da Bugün & Yakında</b>"
+        sub = "Günün taze etkinlik listesi."
+    send_text_message(f"{header}\n<i>{today}</i>\n{sub}", disable_preview=True)
+
+def send_weekly_top_picks(picks, ai_counter):
+    if not picks:
+        return
+    send_text_message(
+        "🏆 <b>Bu Haftanın Editör Seçimleri</b>\n<i>Pek çok etkinlik arasından öne çıkanlar:</i>",
+        disable_preview=True
+    )
+    for i, event in enumerate(picks, 1):
+        if not event.get('summary'):
+            event['summary'] = get_ai_summary(event['title'], event['link'], ai_counter)
+        title   = event['title']
+        link    = event['link']
+        source  = event['source']
+        image   = event.get('image')
+        summary = event.get('summary', '')
+        style   = SOURCE_STYLE.get(source, {"icon": "📅", "label": source})
+
+        caption = (
+            f"🥇 <b>#{i} Editör Seçimi</b>\n\n"
+            f"{style['icon']} <b>{title}</b>\n"
+            f"{'💬 <i>' + summary + '</i>' if summary else ''}\n\n"
+            f"🔗 <a href='{link}'>Etkinlik Sayfası</a>\n"
+            f"<i>{style['label']} · Ankara</i>"
+        )
+        markup = _inline_keyboard(link)
+        if image:
+            send_photo_message(image, caption, reply_markup=markup)
+        else:
+            send_text_message(caption, reply_markup=markup)
+        time.sleep(1)
 
 
-# --- Scrapers ---
-
+# ─────────────────────────────────────────
+# Scrapers
+# ─────────────────────────────────────────
 def scrape_biletix():
     events = []
     category_urls = [
@@ -182,8 +373,7 @@ def scrape_biletix():
         "https://www.biletix.com/anasayfa/ANKARA/tr",
     ]
     seen_slugs = set()
-    fetch_counter = {'count': 0}  # ✅ shared counter caps OG fetches across all Biletix pages
-
+    fetch_counter = {'count': 0}
     for url in category_urls:
         try:
             res = requests.get(url, headers=HEADERS, timeout=15)
@@ -203,16 +393,13 @@ def scrape_biletix():
                     continue
                 seen_slugs.add(href)
                 link = href if href.startswith('http') else f"https://www.biletix.com{href}"
-                # ✅ CHANGED: pass counter so we stop after MAX_OG_FETCHES total
                 image = get_og_image(link, fetch_counter=fetch_counter)
                 time.sleep(0.3)
                 events.append({"title": title, "link": link, "source": "Biletix", "image": image})
         except Exception as e:
             print(f"[Biletix Hata] {url}: {e}")
-
-    print(f"Biletix: {len(events)} etkinlik (OG fetch sayısı: {fetch_counter['count']})")
+    print(f"Biletix: {len(events)} etkinlik")
     return events
-
 
 def scrape_filankara():
     events = []
@@ -236,12 +423,10 @@ def scrape_filankara():
             image = get_og_image(link)
             events.append({"title": title, "link": link, "source": "filAnkara", "image": image})
         if events:
-            print(f"filAnkara: {events[0]['title']}")
             return [events[0]]
     except Exception as e:
         print(f"[filAnkara Hata] {e}")
     return events
-
 
 def scrape_eventbrite():
     events = []
@@ -268,7 +453,6 @@ def scrape_eventbrite():
     print(f"Eventbrite: {len(events)} etkinlik")
     return events
 
-
 def scrape_biletinial():
     events = []
     try:
@@ -288,12 +472,10 @@ def scrape_biletinial():
     print(f"Biletinial: {len(events)} etkinlik")
     return events
 
-
 def scrape_biletimgo():
     events = []
     try:
         res = requests.get("https://www.biletimgo.com/sehir-etkinlikleri/ankara", headers=HEADERS, timeout=15)
-        print(f"[BiletimGO] status: {res.status_code}")
         if res.status_code != 200:
             return events
         soup = BeautifulSoup(res.text, 'html.parser')
@@ -309,18 +491,15 @@ def scrape_biletimgo():
     print(f"BiletimGO: {len(events)} etkinlik")
     return events
 
-
 def scrape_mobilet():
     events = []
-    urls_to_try = [
+    for url in [
         "https://mobilet.com/tr/search/?q=ankara",
         "https://mobilet.com/tr/?city=ankara",
         "https://mobilet.com/tr/events/ankara",
-    ]
-    for url in urls_to_try:
+    ]:
         try:
             res = requests.get(url, headers=HEADERS, timeout=15)
-            print(f"[Mobilet] {url} -> {res.status_code}")
             if res.status_code != 200:
                 continue
             soup = BeautifulSoup(res.text, 'html.parser')
@@ -340,12 +519,10 @@ def scrape_mobilet():
     print(f"Mobilet: {len(events)} etkinlik")
     return events
 
-
 def scrape_abb():
     events = []
     try:
         res = requests.get("https://www.ankara.bel.tr/etkinlikler", headers=HEADERS, timeout=15)
-        print(f"[ABB] status: {res.status_code}")
         if res.status_code != 200:
             return events
         soup = BeautifulSoup(res.text, 'html.parser')
@@ -361,12 +538,10 @@ def scrape_abb():
     print(f"ABB: {len(events)} etkinlik")
     return events
 
-
 def scrape_lakonser():
     events = []
     try:
         res = requests.get("https://lakonser.com/etkinlikler/", headers=HEADERS, timeout=15)
-        print(f"[LaKonser] status: {res.status_code}")
         if res.status_code != 200:
             return events
         soup = BeautifulSoup(res.text, 'html.parser')
@@ -383,68 +558,97 @@ def scrape_lakonser():
     return events
 
 
-def deduplicate(events):
-    seen_links = set()
-    unique = []
-    for e in events:
-        if e['link'] not in seen_links:
-            seen_links.add(e['link'])
-            unique.append(e)
-    return unique
-
-
-# --- Main Pipeline ---
+# ─────────────────────────────────────────
+# Main pipeline
+# ─────────────────────────────────────────
 def run_bot():
     if not TOKEN or not CHAT_ID:
         print("[HATA] TELEGRAM_TOKEN veya TELEGRAM_CHAT_ID tanımlı değil!")
         return
 
-    # ✅ NEW: arm the global timeout so the process can never hang past MAX_RUN_SECONDS
     set_global_timeout(MAX_RUN_SECONDS)
+    seen = load_seen_events()
 
     try:
         print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M')}] Bot başlatılıyor...")
-        seen = load_seen_events()
-        print(f"Daha önce gönderilen etkinlik sayısı: {len(seen)}")
+        print(f"Daha önce görülen etkinlik sayısı: {len(seen)}")
 
         all_events = []
-        all_events.extend(scrape_filankara())
-        all_events.extend(scrape_biletix())
-        all_events.extend(scrape_eventbrite())
-        all_events.extend(scrape_biletinial())
-        all_events.extend(scrape_biletimgo())
-        all_events.extend(scrape_mobilet())
-        all_events.extend(scrape_abb())
-        all_events.extend(scrape_lakonser())
+        for scraper in [
+            scrape_filankara, scrape_biletix, scrape_eventbrite,
+            scrape_biletinial, scrape_biletimgo, scrape_mobilet,
+            scrape_abb, scrape_lakonser
+        ]:
+            all_events.extend(scraper())
 
-        all_events = deduplicate(all_events)
-        print(f"Toplam bulunan etkinlik: {len(all_events)}")
+        # Deduplicate
+        all_events = url_deduplicate(all_events)
+        all_events = fuzzy_deduplicate(all_events)
+        print(f"Deduplikasyon sonrası: {len(all_events)} etkinlik")
 
-        new_count = 0
-        for event in all_events:
-            h = event_hash(event['title'], event['link'])
-            if h in seen:
+        # Filter new only — mark ALL as seen (even image-less, so they don't resurface)
+        new_events = [e for e in all_events if event_hash(e['title'], e['link']) not in seen]
+        for e in new_events:
+            seen.add(event_hash(e['title'], e['link']))
+        print(f"Yeni etkinlik: {len(new_events)}")
+
+        if not new_events:
+            print("Yeni etkinlik bulunamadı.")
+            save_seen_events(seen)
+            return
+
+        # Only send events with images → quality digest
+        digest_events = [e for e in new_events if e.get('image')]
+        print(f"Görselli (digest): {len(digest_events)}")
+
+        if not digest_events:
+            print("Görselli yeni etkinlik yok, gönderilecek bir şey yok.")
+            save_seen_events(seen)
+            return
+
+        # AI summaries
+        ai_counter = {'count': 0}
+        for event in digest_events:
+            event['summary'] = get_ai_summary(event['title'], event['link'], ai_counter)
+            time.sleep(0.4)
+
+        # Categorize
+        categorized = {cat: [] for cat in CATEGORY_MAP}
+        for event in digest_events:
+            categorized[classify_event(event['title'])].append(event)
+
+        # Friday top picks
+        is_friday = datetime.now().weekday() == 4
+        top_picks = get_weekly_top_picks(digest_events) if is_friday else []
+
+        # ── Send ──────────────────────────────────
+        send_daily_intro()
+        time.sleep(1)
+
+        if top_picks:
+            send_weekly_top_picks(top_picks, ai_counter)
+            time.sleep(1)
+
+        sent_count = 0
+        for category, events in categorized.items():
+            if not events:
                 continue
-
-            success = send_event(event)
-            if success:
-                seen.add(h)
-                new_count += 1
-                print(f"[Gönderildi] {event['title']}")
+            send_digest_header(category, len(events))
+            time.sleep(0.8)
+            for event in events:
+                if send_event(event):
+                    sent_count += 1
                 time.sleep(1.5)
 
         save_seen_events(seen)
-        print(f"Tamamlandı. {new_count} yeni etkinlik gönderildi.")
-        if new_count == 0:
-            print("Yeni etkinlik bulunamadı.")
+        print(f"Tamamlandı. {sent_count} etkinlik gönderildi. AI özet: {ai_counter['count']}.")
 
-    except TimeoutError:
-        # ✅ NEW: graceful exit on timeout — still saves whatever was collected
-        print(f"[UYARI] Bot {MAX_RUN_SECONDS}s sınırına ulaştı, erken sonlandırılıyor.")
-        save_seen_events(seen if 'seen' in dir() else set())
+    except BotTimeoutError:
+        print(f"[UYARI] {MAX_RUN_SECONDS}s sınırına ulaşıldı.")
+        save_seen_events(seen)
 
     finally:
-        cancel_global_timeout()  # ✅ always disarm the alarm
+        cancel_global_timeout()
 
 
 if __name__ == "__main__":
