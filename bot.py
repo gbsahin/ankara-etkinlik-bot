@@ -7,7 +7,6 @@ TOKEN = os.getenv('TELEGRAM_TOKEN')
 CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
 DB_FILE = "sent_events.txt"
 
-# 2026 Browser Headers
 HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
     'Accept-Language': 'tr-TR,tr;q=0.9'
@@ -21,54 +20,55 @@ def save_sent_event(link):
     with open(DB_FILE, "a") as f: f.write(link + "\n")
 
 def send_telegram(title, img, link):
-    caption = (
-        f"📍 **YENİ ETKİNLİK: ANKARA**\n\n"
-        f"🎭 {title}\n\n"
-        f"🔗 [Detaylar ve Bilet İçin Tıklayın]({link})\n\n"
-        f"#Ankara #Etkinlik #FilAnkara #Biletix"
-    )
+    caption = f"📍 **ANKARA ETKİNLİK**\n\n🎭 **{title}**\n\n🔗 [Detaylar ve Kayıt İçin Tıklayın]({link})"
     url = f"https://api.telegram.org/bot{TOKEN}/sendPhoto"
     payload = {"chat_id": CHAT_ID, "photo": img, "caption": caption, "parse_mode": "Markdown"}
-    r = requests.post(url, data=payload)
-    print(f"Telegram response: {r.status_code}") # For GitHub logs
+    try:
+        r = requests.post(url, data=payload)
+        print(f"Post Durumu: {r.status_code} - {title[:20]}")
+    except Exception as e:
+        print(f"Telegram Gönderim Hatası: {e}")
 
 def scrape_sources():
     sent = load_sent_events()
     
-    # 1. Fil Ankara (2026 Structure)
+    # --- BILETIX SCRAPER (Safe Version) ---
+    print("Biletix taranıyor...")
     try:
-        res = requests.get("https://filankara.beehiiv.com/", headers=HEADERS, timeout=15)
-        soup = BeautifulSoup(res.text, 'html.parser')
-        # Fil Ankara now uses 'post-card' or 'beehiiv-post-card'
-        for card in soup.select('div[class*="post-card"]')[:5]:
-            title_tag = card.select_one('h2') or card.select_one('h3')
-            link_tag = card.select_one('a')
-            img_tag = card.select_one('img')
-            
-            if title_tag and link_tag:
-                title = title_tag.text.strip()
-                link = link_tag['href']
-                if not link.startswith('http'): link = "https://filankara.beehiiv.com" + link
-                img = img_tag['src'] if img_tag else "https://filankara.com/wp-content/uploads/2022/11/filankara-logo.png"
-                
-                if link not in sent:
-                    send_telegram(title, img, link)
-                    save_sent_event(link)
-    except Exception as e: print(f"Fil Ankara Hatası: {e}")
-
-    # 2. Biletix (2026 Structure)
-    try:
-        # Ankara Events Search
         res = requests.get("https://www.biletix.com/search/TURKIYE/tr#ankara", headers=HEADERS, timeout=15)
         soup = BeautifulSoup(res.text, 'html.parser')
-        for event in soup.select('.searchResultEventName')[:5]:
-            title = event.text.strip()
-            link = "https://www.biletix.com" + event.find_parent('a')['href']
-            img = "https://www.biletix.com/static/images/biletix_logo.png" # Safe placeholder
-            if link not in sent:
-                send_telegram(title, img, link)
-                save_sent_event(link)
-    except Exception as e: print(f"Biletix Hatası: {e}")
+        events = soup.find_all(class_='searchResultEventName')
+        
+        for ev in events[:5]:
+            parent = ev.find_parent('a')
+            # The 'Safe-Grab' check:
+            if parent and parent.has_attr('href'):
+                link = "https://www.biletix.com" + parent['href']
+                title = ev.get_text(strip=True)
+                if link not in sent:
+                    img = "https://www.biletix.com/static/images/biletix_logo.png"
+                    send_telegram(title, img, link)
+                    save_sent_event(link)
+    except Exception as e:
+        print(f"Biletix Hatası Atlatıldı: {e}")
+
+    # --- FIL ANKARA SCRAPER (2026 Version) ---
+    print("Fil Ankara taranıyor...")
+    try:
+        res = requests.get("https://filankara.com/", headers=HEADERS, timeout=15)
+        soup = BeautifulSoup(res.text, 'html.parser')
+        # Looking for the most recent article links
+        for a_tag in soup.find_all('a', href=True):
+            if '/etkinlik/' in a_tag['href'] or '/p/' in a_tag['href']:
+                link = a_tag['href']
+                title = a_tag.get_text().strip()
+                if len(title) > 10 and link not in sent:
+                    img = "https://filankara.com/wp-content/uploads/2022/11/filankara-logo.png"
+                    send_telegram(title, img, link)
+                    save_sent_event(link)
+                    break # Just grab the top one
+    except Exception as e:
+        print(f"Fil Ankara Hatası Atlatıldı: {e}")
 
 if __name__ == "__main__":
     scrape_sources()
