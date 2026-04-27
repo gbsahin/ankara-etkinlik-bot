@@ -15,7 +15,7 @@ HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
                   '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
     'Accept-Language': 'tr-TR,tr;q=0.9,en;q=0.8',
-    'Accept': 'application/json, text/html, */*',
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
 }
 
 
@@ -41,7 +41,7 @@ def send_telegram_message(text, parse_mode="Markdown"):
         "chat_id": CHAT_ID,
         "text": text,
         "parse_mode": parse_mode,
-        "disable_web_page_preview": False
+        "disable_web_page_preview": True
     }
     try:
         r = requests.post(url, json=payload, timeout=10)
@@ -54,152 +54,135 @@ def send_telegram_message(text, parse_mode="Markdown"):
         return False
 
 
-# --- Scrapers ---
+# --- Scrapers with heavy debug output ---
 
 def scrape_biletix():
-    """
-    Biletix exposes a JSON search API — much more reliable than scraping HTML.
-    """
     events = []
+    print("\n=== BİLETİX SCRAPING ===")
+
+    # Try JSON API first
     try:
-        # Biletix internal search API
         api_url = "https://www.biletix.com/searcher/TURKIYE/tr/results"
-        params = {
-            "searchterm": "",
-            "city": "ANKARA",
-            "category": "",
-            "page": 1
-        }
+        params = {"searchterm": "", "city": "ANKARA", "category": "", "page": 1}
         res = requests.get(api_url, headers=HEADERS, params=params, timeout=15)
-        res.raise_for_status()
-        data = res.json()
+        print(f"Biletix API status: {res.status_code}")
+        print(f"Biletix API response (first 500 chars): {res.text[:500]}")
 
-        # The API returns events in different possible structures
-        items = data.get("events") or data.get("results") or data.get("items") or []
-        if isinstance(items, dict):
-            items = items.get("event") or []
-
-        for item in items:
-            title = item.get("name") or item.get("title") or item.get("eventName", "")
-            slug = item.get("slug") or item.get("id") or item.get("eventId", "")
-            if not title:
-                continue
-            link = f"https://www.biletix.com/etkinlik/{slug}/TURKIYE/tr" if slug else "https://www.biletix.com"
-            events.append({"title": title.strip(), "link": link, "source": "Biletix"})
-
+        if res.status_code == 200:
+            try:
+                data = res.json()
+                print(f"Biletix API keys: {list(data.keys()) if isinstance(data, dict) else type(data)}")
+            except Exception as je:
+                print(f"Biletix API JSON parse hatası: {je}")
     except Exception as e:
-        print(f"[Biletix API Hata] {e}")
-        # Fallback: try scraping the mobile/lite version
-        events.extend(scrape_biletix_fallback())
+        print(f"Biletix API isteği hatası: {e}")
 
-    return events
-
-
-def scrape_biletix_fallback():
-    """Fallback: scrape Biletix's lighter search page."""
-    events = []
+    # Try HTML scraping
     try:
         url = "https://www.biletix.com/search/ANKARA/tr"
         res = requests.get(url, headers=HEADERS, timeout=15)
+        print(f"\nBiletix HTML status: {res.status_code}")
         soup = BeautifulSoup(res.text, 'html.parser')
+        all_links = soup.find_all('a', href=True)
+        print(f"Biletix sayfasındaki toplam link sayısı: {len(all_links)}")
 
-        # Try multiple selectors Biletix has used over time
-        selectors = [
-            ('a', {'class': lambda c: c and 'event' in c.lower()}),
-            ('a', {'href': lambda h: h and ('/etkinlik/' in h or '/event/' in h)}),
-            ('div', {'class': lambda c: c and 'event-name' in c.lower()}),
-        ]
+        print("İlk 10 link:")
+        for a in all_links[:10]:
+            print(f"  href={a['href']} | text={a.get_text(strip=True)[:50]}")
 
-        for tag, attrs in selectors:
-            for el in soup.find_all(tag, attrs):
-                title = el.get_text(strip=True)
-                href = el.get('href', '')
-                if not title or len(title) < 3:
-                    continue
-                link = href if href.startswith('http') else f"https://www.biletix.com{href}"
-                events.append({"title": title, "link": link, "source": "Biletix"})
-            if events:
-                break
+        print("\nEtkinlik içerebilecek linkler:")
+        for a in all_links:
+            href = a['href']
+            if any(kw in href for kw in ['/etkinlik/', '/event/', '/bilet/', 'ticket']):
+                title = a.get_text(strip=True)
+                print(f"  BULUNDU: {title[:60]} -> {href[:80]}")
+                if title and len(title) > 3:
+                    link = href if href.startswith('http') else f"https://www.biletix.com{href}"
+                    events.append({"title": title, "link": link, "source": "Biletix"})
 
     except Exception as e:
-        print(f"[Biletix Fallback Hata] {e}")
+        print(f"Biletix HTML hata: {e}")
 
+    print(f"Biletix toplam etkinlik: {len(events)}")
     return events
 
 
 def scrape_eventbrite():
-    """Scrape Eventbrite for Ankara events."""
     events = []
-    urls = [
-        "https://www.eventbrite.com/d/turkey--ankara/events/",
-        "https://www.eventbrite.com/d/turkey--ankara/music/",
-        "https://www.eventbrite.com/d/turkey--ankara/arts/",
-    ]
-    for url in urls:
-        try:
-            res = requests.get(url, headers=HEADERS, timeout=15)
-            res.raise_for_status()
-            soup = BeautifulSoup(res.text, 'html.parser')
+    print("\n=== EVENTBRITE SCRAPING ===")
+    url = "https://www.eventbrite.com/d/turkey--ankara/events/"
+    try:
+        res = requests.get(url, headers=HEADERS, timeout=15)
+        print(f"Eventbrite status: {res.status_code}")
+        soup = BeautifulSoup(res.text, 'html.parser')
+        all_links = soup.find_all('a', href=True)
+        print(f"Eventbrite toplam link: {len(all_links)}")
 
-            for a in soup.find_all('a', href=True):
-                href = a['href']
-                if "/e/" in href and "eventbrite.com" in href:
-                    title = a.get_text(strip=True)
-                    if not title or len(title) < 3:
-                        continue
+        for a in all_links:
+            href = a['href']
+            if "/e/" in href and "eventbrite.com" in href:
+                title = a.get_text(strip=True)
+                if title and len(title) > 3:
+                    print(f"  BULUNDU: {title[:60]}")
                     events.append({"title": title, "link": href, "source": "Eventbrite"})
-        except Exception as e:
-            print(f"[Eventbrite Hata] {url}: {e}")
+    except Exception as e:
+        print(f"Eventbrite hata: {e}")
+
+    print(f"Eventbrite toplam etkinlik: {len(events)}")
     return events
 
 
 def scrape_mobilet():
-    """Scrape Mobilet - another major Turkish ticketing site with Ankara events."""
     events = []
+    print("\n=== MOBİLET SCRAPING ===")
     try:
         url = "https://www.mobilet.com/etkinlikler/?city=ankara"
         res = requests.get(url, headers=HEADERS, timeout=15)
-        res.raise_for_status()
+        print(f"Mobilet status: {res.status_code}")
         soup = BeautifulSoup(res.text, 'html.parser')
+        all_links = soup.find_all('a', href=True)
+        print(f"Mobilet toplam link: {len(all_links)}")
 
-        for a in soup.find_all('a', href=True):
+        for a in all_links:
             href = a['href']
-            if '/etkinlik/' in href or '/event/' in href:
+            if any(kw in href for kw in ['/etkinlik/', '/event/']):
                 title = a.get_text(strip=True)
-                if not title or len(title) < 3:
-                    continue
-                link = href if href.startswith('http') else f"https://www.mobilet.com{href}"
-                events.append({"title": title, "link": link, "source": "Mobilet"})
+                if title and len(title) > 3:
+                    print(f"  BULUNDU: {title[:60]}")
+                    link = href if href.startswith('http') else f"https://www.mobilet.com{href}"
+                    events.append({"title": title, "link": link, "source": "Mobilet"})
     except Exception as e:
-        print(f"[Mobilet Hata] {e}")
+        print(f"Mobilet hata: {e}")
+
+    print(f"Mobilet toplam etkinlik: {len(events)}")
     return events
 
 
 def scrape_konser_org():
-    """Scrape konser.org - Turkish concert listings."""
     events = []
+    print("\n=== KONSER.ORG SCRAPING ===")
     try:
         url = "https://konser.org/ankara-konserleri"
         res = requests.get(url, headers=HEADERS, timeout=15)
-        res.raise_for_status()
+        print(f"Konser.org status: {res.status_code}")
         soup = BeautifulSoup(res.text, 'html.parser')
+        all_links = soup.find_all('a', href=True)
+        print(f"Konser.org toplam link: {len(all_links)}")
 
-        for a in soup.find_all('a', href=True):
+        for a in all_links:
             href = a['href']
-            if href and len(href) > 5 and href != '#':
-                title = a.get_text(strip=True)
-                if not title or len(title) < 3:
-                    continue
-                # Filter out nav/footer links by title length
-                if len(title) > 8:
-                    link = href if href.startswith('http') else f"https://konser.org{href}"
-                    events.append({"title": title, "link": link, "source": "Konser.org"})
+            title = a.get_text(strip=True)
+            if title and len(title) > 8 and href and href != '#':
+                print(f"  BULUNDU: {title[:60]} -> {href[:60]}")
+                link = href if href.startswith('http') else f"https://konser.org{href}"
+                events.append({"title": title, "link": link, "source": "Konser.org"})
     except Exception as e:
-        print(f"[Konser.org Hata] {e}")
+        print(f"Konser.org hata: {e}")
+
+    print(f"Konser.org toplam etkinlik: {len(events)}")
     return events
 
 
-# --- Dedup helper ---
 def deduplicate(events):
     seen_links = set()
     unique = []
@@ -210,14 +193,18 @@ def deduplicate(events):
     return unique
 
 
-# --- Main Pipeline ---
+# --- Main ---
 def run_bot():
     if not TOKEN or not CHAT_ID:
         print("[HATA] TELEGRAM_TOKEN veya TELEGRAM_CHAT_ID tanımlı değil!")
         return
 
     print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M')}] Bot başlatılıyor...")
-    seen = load_seen_events()
+    print(f"CHAT_ID: {CHAT_ID}")
+
+    # Clear seen events for this debug run so everything gets sent
+    seen = set()
+    print("DEBUG: seen_events temizlendi, tüm etkinlikler gönderilecek")
 
     all_events = []
     all_events.extend(scrape_biletix())
@@ -226,17 +213,14 @@ def run_bot():
     all_events.extend(scrape_konser_org())
 
     all_events = deduplicate(all_events)
-    print(f"Toplam bulunan etkinlik: {len(all_events)}")
+    print(f"\n=== TOPLAM: {len(all_events)} etkinlik bulundu ===")
 
+    # Send only first 5 to avoid spam
     new_count = 0
-    for event in all_events:
+    for event in all_events[:5]:
         title = event['title']
         link = event['link']
         source = event['source']
-
-        h = event_hash(title, link)
-        if h in seen:
-            continue
 
         msg = (
             f"🎉 *YENİ ETKİNLİK* — {source}\n\n"
@@ -245,15 +229,11 @@ def run_bot():
         )
         success = send_telegram_message(msg)
         if success:
-            seen.add(h)
             new_count += 1
             print(f"[Gönderildi] {title}")
-            time.sleep(1)
+        time.sleep(1)
 
-    save_seen_events(seen)
-    print(f"Tamamlandı. {new_count} yeni etkinlik gönderildi.")
-    if new_count == 0:
-        print("Yeni etkinlik bulunamadı.")
+    print(f"\nTamamlandı. {new_count} etkinlik gönderildi.")
 
 
 if __name__ == "__main__":
