@@ -16,8 +16,8 @@ TOKEN            = os.getenv('TELEGRAM_TOKEN')
 CHAT_ID          = os.getenv('TELEGRAM_CHAT_ID')
 SEEN_EVENTS_FILE = "seen_events.json"
 
-MAX_RUN_SECONDS  = 360   # hard stop after 6 minutes
-MAX_OG_FETCHES   = 25    # max image fetches per run
+MAX_RUN_SECONDS  = 480   # hard stop after 8 minutes
+MAX_OG_FETCHES   = 80    # max image fetches per run (covers all sources)
 FUZZY_THRESHOLD  = 0.82  # titles this similar → duplicate
 
 HEADERS = {
@@ -239,7 +239,7 @@ def send_event(event):
 # ─────────────────────────────────────────
 # Scrapers
 # ─────────────────────────────────────────
-def scrape_biletix():
+def scrape_biletix(fetch_counter):
     events = []
     category_urls = [
         "https://www.biletix.com/category/MUSIC/ANKARA/tr",
@@ -250,7 +250,6 @@ def scrape_biletix():
         "https://www.biletix.com/anasayfa/ANKARA/tr",
     ]
     seen_slugs = set()
-    fetch_counter = {'count': 0}
     for url in category_urls:
         try:
             res = requests.get(url, headers=HEADERS, timeout=15)
@@ -278,7 +277,7 @@ def scrape_biletix():
     print(f"Biletix: {len(events)} etkinlik")
     return events
 
-def scrape_filankara():
+def scrape_filankara(fetch_counter):
     events = []
     try:
         res = requests.get("https://filankara.beehiiv.com/", headers=HEADERS, timeout=15)
@@ -297,7 +296,7 @@ def scrape_filankara():
             if link in seen_links:
                 continue
             seen_links.add(link)
-            image = get_og_image(link)
+            image = get_og_image(link, fetch_counter)
             events.append({"title": title, "link": link, "source": "filAnkara", "image": image})
         if events:
             print(f"filAnkara: {events[0]['title']}")
@@ -306,7 +305,7 @@ def scrape_filankara():
         print(f"[filAnkara Hata] {e}")
     return events
 
-def scrape_eventbrite():
+def scrape_eventbrite(fetch_counter):
     events = []
     seen_links = set()
     try:
@@ -325,13 +324,15 @@ def scrape_eventbrite():
             if clean_link in seen_links:
                 continue
             seen_links.add(clean_link)
-            events.append({"title": title, "link": clean_link, "source": "Eventbrite", "image": None})
+            image = get_og_image(clean_link, fetch_counter)
+            time.sleep(0.2)
+            events.append({"title": title, "link": clean_link, "source": "Eventbrite", "image": image})
     except Exception as e:
         print(f"[Eventbrite Hata] {e}")
     print(f"Eventbrite: {len(events)} etkinlik")
     return events
 
-def scrape_biletinial():
+def scrape_biletinial(fetch_counter):
     events = []
     try:
         res = requests.get("https://www.biletinial.com/ankara-etkinlikleri", headers=HEADERS, timeout=15)
@@ -344,13 +345,15 @@ def scrape_biletinial():
                 title = a.get_text(strip=True)
                 if title and len(title) > 4:
                     link = href if href.startswith('http') else f"https://www.biletinial.com{href}"
-                    events.append({"title": title, "link": link, "source": "Biletinial", "image": None})
+                    image = get_og_image(link, fetch_counter)
+                    time.sleep(0.2)
+                    events.append({"title": title, "link": link, "source": "Biletinial", "image": image})
     except Exception as e:
         print(f"[Biletinial Hata] {e}")
     print(f"Biletinial: {len(events)} etkinlik")
     return events
 
-def scrape_biletimgo():
+def scrape_biletimgo(fetch_counter):
     events = []
     try:
         res = requests.get("https://www.biletimgo.com/sehir-etkinlikleri/ankara", headers=HEADERS, timeout=15)
@@ -363,13 +366,15 @@ def scrape_biletimgo():
                 title = a.get_text(strip=True)
                 if title and len(title) > 4:
                     link = href if href.startswith('http') else f"https://www.biletimgo.com{href}"
-                    events.append({"title": title, "link": link, "source": "BiletimGO", "image": None})
+                    image = get_og_image(link, fetch_counter)
+                    time.sleep(0.2)
+                    events.append({"title": title, "link": link, "source": "BiletimGO", "image": image})
     except Exception as e:
         print(f"[BiletimGO Hata] {e}")
     print(f"BiletimGO: {len(events)} etkinlik")
     return events
 
-def scrape_mobilet():
+def scrape_mobilet(fetch_counter):
     events = []
     for url in [
         "https://mobilet.com/tr/search/?q=ankara",
@@ -388,7 +393,9 @@ def scrape_mobilet():
                     title = a.get_text(strip=True)
                     if title and len(title) > 4:
                         link = href if href.startswith('http') else f"https://mobilet.com{href}"
-                        found.append({"title": title, "link": link, "source": "Mobilet", "image": None})
+                        image = get_og_image(link, fetch_counter)
+                        time.sleep(0.2)
+                        found.append({"title": title, "link": link, "source": "Mobilet", "image": image})
             if found:
                 events = found
                 break
@@ -397,7 +404,7 @@ def scrape_mobilet():
     print(f"Mobilet: {len(events)} etkinlik")
     return events
 
-def scrape_abb():
+def scrape_abb(fetch_counter):
     events = []
     try:
         res = requests.get("https://www.ankara.bel.tr/etkinlikler", headers=HEADERS, timeout=15)
@@ -410,13 +417,15 @@ def scrape_abb():
                 title = a.get_text(strip=True)
                 if title and len(title) > 4:
                     link = href if href.startswith('http') else f"https://www.ankara.bel.tr{href}"
-                    events.append({"title": title, "link": link, "source": "ABB", "image": None})
+                    image = get_og_image(link, fetch_counter)
+                    time.sleep(0.2)
+                    events.append({"title": title, "link": link, "source": "ABB", "image": image})
     except Exception as e:
         print(f"[ABB Hata] {e}")
     print(f"ABB: {len(events)} etkinlik")
     return events
 
-def scrape_lakonser():
+def scrape_lakonser(fetch_counter):
     events = []
     try:
         res = requests.get("https://lakonser.com/etkinlikler/", headers=HEADERS, timeout=15)
@@ -429,7 +438,9 @@ def scrape_lakonser():
                 title = a.get_text(strip=True)
                 if title and len(title) > 4:
                     link = href if href.startswith('http') else f"https://lakonser.com{href}"
-                    events.append({"title": title, "link": link, "source": "LaKonser", "image": None})
+                    image = get_og_image(link, fetch_counter)
+                    time.sleep(0.2)
+                    events.append({"title": title, "link": link, "source": "LaKonser", "image": image})
     except Exception as e:
         print(f"[LaKonser Hata] {e}")
     print(f"LaKonser: {len(events)} etkinlik")
@@ -451,13 +462,14 @@ def run_bot():
         print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M')}] Bot başlatılıyor...")
         print(f"Daha önce görülen etkinlik: {len(seen)}")
 
+        fetch_counter = {'count': 0}
         all_events = []
         for scraper in [
             scrape_filankara, scrape_biletix, scrape_eventbrite,
             scrape_biletinial, scrape_biletimgo, scrape_mobilet,
             scrape_abb, scrape_lakonser
         ]:
-            all_events.extend(scraper())
+            all_events.extend(scraper(fetch_counter))
 
         all_events = url_deduplicate(all_events)
         all_events = fuzzy_deduplicate(all_events)
