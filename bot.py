@@ -3,6 +3,7 @@ from bs4 import BeautifulSoup
 import os
 import json
 import hashlib
+import html as html_lib
 import time
 import signal
 import re
@@ -16,9 +17,10 @@ TOKEN            = os.getenv('TELEGRAM_TOKEN')
 CHAT_ID          = os.getenv('TELEGRAM_CHAT_ID')
 SEEN_EVENTS_FILE = "seen_events.json"
 
-MAX_RUN_SECONDS  = 480   # hard stop after 8 minutes
-MAX_OG_FETCHES   = 80    # max image fetches per run (covers all sources)
-FUZZY_THRESHOLD  = 0.82  # titles this similar → duplicate
+MAX_RUN_SECONDS    = 480   # hard stop after 8 minutes
+MAX_OG_FETCHES     = 80    # max page/image fetches per run (covers all sources)
+FUZZY_THRESHOLD    = 0.82  # titles this similar → duplicate
+MAX_SENDS_PER_RUN  = 30    # flood guard: leftover events go out on the next run
 
 HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
@@ -26,6 +28,23 @@ HEADERS = {
     'Accept-Language': 'tr-TR,tr;q=0.9,en;q=0.8',
     'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
 }
+
+SESSION = requests.Session()
+SESSION.headers.update(HEADERS)
+
+# Ankara + district/venue names accepted as proof of location
+ANKARA_HINTS = (
+    'ankara', 'çankaya', 'cankaya', 'kızılay', 'kizilay', 'yenimahalle',
+    'keçiören', 'kecioren', 'çayyolu', 'cayyolu', 'batıkent', 'batikent',
+    'gölbaşı', 'golbasi', 'ulus', 'bilkent', 'odtü', 'metu', 'incek',
+    'bahçelievler', 'bahcelievler', 'etimesgut', 'sincan', 'mamak',
+)
+
+# Titles that scream "online" — cheap prefilter before any page fetch
+ONLINE_TITLE_RE = re.compile(
+    r'\b(online|webinar|webinaire|virtual|sanal|zoom|livestream|live stream)\b',
+    re.IGNORECASE,
+)
 
 BILETIX_IGNORE_KEYWORDS = [
     'myaccount', 'my-tickets', 'business.ticketmaster', 'trust.ticketmaster',
@@ -146,26 +165,109 @@ def classify_event(title):
 
 
 # ─────────────────────────────────────────
-# Image fetcher
+# Page / image fetcher
 # ─────────────────────────────────────────
-def get_og_image(url, fetch_counter=None):
+def fetch_page(url, fetch_counter=None, timeout=8):
+    """Fetch a page's HTML, honoring the global fetch budget. Returns str or None."""
     if fetch_counter is not None:
         if fetch_counter.get('count', 0) >= MAX_OG_FETCHES:
             return None
         fetch_counter['count'] = fetch_counter.get('count', 0) + 1
     try:
-        res = requests.get(url, headers=HEADERS, timeout=6)
+        res = SESSION.get(url, timeout=timeout)
         if res.status_code != 200:
             return None
-        soup = BeautifulSoup(res.text, 'html.parser')
-        for attr in ['og:image', 'twitter:image']:
-            tag = soup.find('meta', property=attr) or soup.find('meta', attrs={'name': attr})
-            if tag and tag.get('content'):
-                img_url = tag['content'].strip()
-                if img_url.startswith('http'):
-                    return img_url
+        return res.text
     except Exception:
-        pass
+        return None
+
+def og_image_from_soup(soup):
+    for attr in ['og:image', 'twitter:image']:
+        tag = soup.find('meta', property=attr) or soup.find('meta', attrs={'name': attr})
+        if tag and tag.get('content'):
+            img_url = tag['content'].strip()
+            if img_url.startswith('http'):
+                return img_url
+    return None
+
+def get_og_image(url, fetch_counter=None):
+    page = fetch_page(url, fetch_counter, timeout=6)
+    if not page:
+        return None
+    return og_image_from_soup(BeautifulSoup(page, 'html.parser'))
+
+
+# ─────────────────────────────────────────
+# Location verification (JSON-LD schema.org)
+# ─────────────────────────────────────────
+def jsonld_events(soup):
+    """Yield schema.org Event dicts found in a page."""
+    for script in soup.find_all('script', type='application/ld+json'):
+        try:
+            data = json.loads(script.string or '')
+        except Exception:
+            continue
+        items = data if isinstance(data, list) else [data]
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            types = item.get('@type')
+            types = types if isinstance(types, list) else [types]
+            if 'Event' in types or any(isinstance(t, str) and t.endswith('Event') for t in types if t):
+                yield item
+
+def is_ankara_event_page(soup):
+    """
+    Strict check on an event page's structured data:
+    the event must be a physical (non-online) event located in Ankara.
+    Returns True only when this can be positively verified.
+    """
+    for item in jsonld_events(soup):
+        mode = str(item.get('eventAttendanceMode', ''))
+        if 'Online' in mode:
+            return False
+        loc = item.get('location') or {}
+        if isinstance(loc, dict) and loc.get('@type') == 'VirtualLocation':
+            return False
+        loc_text = json.dumps(loc, ensure_ascii=False).lower()
+        return any(hint in loc_text for hint in ANKARA_HINTS)
+    return False  # no structured data → cannot verify → reject
+
+
+# ─────────────────────────────────────────
+# Embedded JSON extractor (window.__SERVER_DATA__ etc.)
+# ─────────────────────────────────────────
+def extract_embedded_json(html, marker):
+    """Extract the JSON object assigned right after `marker` in raw HTML."""
+    m = re.search(re.escape(marker) + r'\s*=\s*', html)
+    if not m:
+        return None
+    start = html.find('{', m.end())
+    if start == -1:
+        return None
+    depth, i, in_str, esc = 0, start, False, False
+    while i < len(html):
+        ch = html[i]
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == '\\':
+                esc = True
+            elif ch == '"':
+                in_str = False
+        else:
+            if ch == '"':
+                in_str = True
+            elif ch == '{':
+                depth += 1
+            elif ch == '}':
+                depth -= 1
+                if depth == 0:
+                    try:
+                        return json.loads(html[start:i + 1])
+                    except Exception:
+                        return None
+        i += 1
     return None
 
 
@@ -204,17 +306,23 @@ def send_text_message(text, disable_preview=True):
         print(f"[Telegram İstisna] {e}")
         return False
 
+TR_MONTHS = ["Ocak", "Şubat", "Mart", "Nisan", "Mayıs", "Haziran",
+             "Temmuz", "Ağustos", "Eylül", "Ekim", "Kasım", "Aralık"]
+
+def turkish_date(dt=None):
+    dt = dt or datetime.now()
+    return f"{dt.day:02d} {TR_MONTHS[dt.month - 1]} {dt.year}"
+
 def send_category_header(category, count):
-    today = datetime.now().strftime("%d %B %Y")
     text = (
         f"\n{category}\n"
-        f"<i>{today} · {count} etkinlik</i>\n"
+        f"<i>{turkish_date()} · {count} etkinlik</i>\n"
         f"{'─' * 20}"
     )
     send_text_message(text)
 
 def send_event(event):
-    title  = event['title']
+    title  = html_lib.escape(event['title'])  # titles with & < > break HTML parse_mode
     link   = event['link']
     source = event['source']
     image  = event.get('image')
@@ -252,10 +360,10 @@ def scrape_biletix(fetch_counter):
     seen_slugs = set()
     for url in category_urls:
         try:
-            res = requests.get(url, headers=HEADERS, timeout=15)
-            if res.status_code != 200:
+            page = fetch_page(url, timeout=15)
+            if not page:
                 continue
-            soup = BeautifulSoup(res.text, 'html.parser')
+            soup = BeautifulSoup(page, 'html.parser')
             for a in soup.find_all('a', href=True):
                 href = a['href']
                 if '/etkinlik/' not in href:
@@ -280,10 +388,10 @@ def scrape_biletix(fetch_counter):
 def scrape_filankara(fetch_counter):
     events = []
     try:
-        res = requests.get("https://filankara.beehiiv.com/", headers=HEADERS, timeout=15)
-        if res.status_code != 200:
+        page = fetch_page("https://filankara.beehiiv.com/", timeout=15)
+        if not page:
             return events
-        soup = BeautifulSoup(res.text, 'html.parser')
+        soup = BeautifulSoup(page, 'html.parser')
         seen_links = set()
         for a in soup.find_all('a', href=True):
             href = a['href']
@@ -305,28 +413,81 @@ def scrape_filankara(fetch_counter):
         print(f"[filAnkara Hata] {e}")
     return events
 
+def _eventbrite_candidates_from_server_data(data):
+    """
+    Eventbrite's listing page embeds window.__SERVER_DATA__ with 'buckets'.
+    When Ankara has few physical events, the page pads itself with an
+    'online_events' bucket — the source of the non-Ankara notifications.
+    Keep only non-online events from non-online buckets.
+    """
+    candidates = []
+    for bucket in data.get('buckets') or []:
+        key = str(bucket.get('key') or '').lower()
+        name = str(bucket.get('name') or '').lower()
+        if 'online' in key or 'online' in name:
+            continue
+        for ev in bucket.get('events') or []:
+            if not isinstance(ev, dict) or ev.get('is_online_event'):
+                continue
+            title = (ev.get('name') or '').strip()
+            link = (ev.get('url') or '').split('?')[0]
+            if title and '/e/' in link:
+                candidates.append({"title": title, "link": link})
+    return candidates
+
+def _eventbrite_candidates_from_anchors(soup):
+    """Fallback if the embedded JSON layout ever changes."""
+    candidates, seen_links = [], set()
+    for a in soup.find_all('a', href=True):
+        href = a['href']
+        if "/e/" not in href or "eventbrite." not in href:
+            continue
+        title = a.get_text(strip=True)
+        if not title or len(title) < 4:
+            continue
+        clean_link = href.split("?")[0]
+        if clean_link in seen_links:
+            continue
+        seen_links.add(clean_link)
+        candidates.append({"title": title, "link": clean_link})
+    return candidates
+
 def scrape_eventbrite(fetch_counter):
     events = []
-    seen_links = set()
     try:
-        res = requests.get("https://www.eventbrite.com/d/turkey--ankara/events/", headers=HEADERS, timeout=15)
-        if res.status_code != 200:
+        page = fetch_page("https://www.eventbrite.com/d/turkey--ankara/events/", timeout=15)
+        if not page:
             return events
-        soup = BeautifulSoup(res.text, 'html.parser')
-        for a in soup.find_all('a', href=True):
-            href = a['href']
-            if "/e/" not in href or "eventbrite.com" not in href:
+
+        data = extract_embedded_json(page, 'window.__SERVER_DATA__')
+        if data:
+            candidates = _eventbrite_candidates_from_server_data(data)
+        else:
+            print("[Eventbrite] __SERVER_DATA__ bulunamadı, anchor fallback kullanılıyor")
+            candidates = _eventbrite_candidates_from_anchors(BeautifulSoup(page, 'html.parser'))
+
+        skipped = 0
+        for c in candidates:
+            # Cheap prefilter: obviously-online titles don't deserve a fetch
+            if ONLINE_TITLE_RE.search(c['title']):
+                skipped += 1
                 continue
-            title = a.get_text(strip=True)
-            if not title or len(title) < 4:
+            # Strict verification on the event's own page (JSON-LD):
+            # must be a physical event located in Ankara.
+            ev_page = fetch_page(c['link'], fetch_counter)
+            if not ev_page:
+                skipped += 1
                 continue
-            clean_link = href.split("?")[0]
-            if clean_link in seen_links:
+            soup = BeautifulSoup(ev_page, 'html.parser')
+            if not is_ankara_event_page(soup):
+                skipped += 1
                 continue
-            seen_links.add(clean_link)
-            image = get_og_image(clean_link, fetch_counter)
+            image = og_image_from_soup(soup)
             time.sleep(0.2)
-            events.append({"title": title, "link": clean_link, "source": "Eventbrite", "image": image})
+            events.append({"title": c['title'], "link": c['link'],
+                           "source": "Eventbrite", "image": image})
+        if skipped:
+            print(f"[Eventbrite] {skipped} online/Ankara dışı etkinlik elendi")
     except Exception as e:
         print(f"[Eventbrite Hata] {e}")
     print(f"Eventbrite: {len(events)} etkinlik")
@@ -335,10 +496,10 @@ def scrape_eventbrite(fetch_counter):
 def scrape_biletinial(fetch_counter):
     events = []
     try:
-        res = requests.get("https://www.biletinial.com/ankara-etkinlikleri", headers=HEADERS, timeout=15)
-        if res.status_code != 200:
+        page = fetch_page("https://www.biletinial.com/ankara-etkinlikleri", timeout=15)
+        if not page:
             return events
-        soup = BeautifulSoup(res.text, 'html.parser')
+        soup = BeautifulSoup(page, 'html.parser')
         for a in soup.find_all('a', href=True):
             href = a['href']
             if '/etkinlik/' in href or '/event/' in href:
@@ -356,10 +517,10 @@ def scrape_biletinial(fetch_counter):
 def scrape_biletimgo(fetch_counter):
     events = []
     try:
-        res = requests.get("https://www.biletimgo.com/sehir-etkinlikleri/ankara", headers=HEADERS, timeout=15)
-        if res.status_code != 200:
+        page = fetch_page("https://www.biletimgo.com/sehir-etkinlikleri/ankara", timeout=15)
+        if not page:
             return events
-        soup = BeautifulSoup(res.text, 'html.parser')
+        soup = BeautifulSoup(page, 'html.parser')
         for a in soup.find_all('a', href=True):
             href = a['href']
             if '/etkinlik/' in href or '/event/' in href:
@@ -382,10 +543,10 @@ def scrape_mobilet(fetch_counter):
         "https://mobilet.com/tr/events/ankara",
     ]:
         try:
-            res = requests.get(url, headers=HEADERS, timeout=15)
-            if res.status_code != 200:
+            page = fetch_page(url, timeout=15)
+            if not page:
                 continue
-            soup = BeautifulSoup(res.text, 'html.parser')
+            soup = BeautifulSoup(page, 'html.parser')
             found = []
             for a in soup.find_all('a', href=True):
                 href = a['href']
@@ -407,10 +568,10 @@ def scrape_mobilet(fetch_counter):
 def scrape_abb(fetch_counter):
     events = []
     try:
-        res = requests.get("https://www.ankara.bel.tr/etkinlikler", headers=HEADERS, timeout=15)
-        if res.status_code != 200:
+        page = fetch_page("https://www.ankara.bel.tr/etkinlikler", timeout=15)
+        if not page:
             return events
-        soup = BeautifulSoup(res.text, 'html.parser')
+        soup = BeautifulSoup(page, 'html.parser')
         for a in soup.find_all('a', href=True):
             href = a['href']
             if '/etkinlik' in href or '/event' in href:
@@ -428,10 +589,10 @@ def scrape_abb(fetch_counter):
 def scrape_lakonser(fetch_counter):
     events = []
     try:
-        res = requests.get("https://lakonser.com/etkinlikler/", headers=HEADERS, timeout=15)
-        if res.status_code != 200:
+        page = fetch_page("https://lakonser.com/etkinlikler/", timeout=15)
+        if not page:
             return events
-        soup = BeautifulSoup(res.text, 'html.parser')
+        soup = BeautifulSoup(page, 'html.parser')
         for a in soup.find_all('a', href=True):
             href = a['href']
             if 'lakonser.com' in href or href.startswith('/etkinlik/'):
@@ -475,17 +636,22 @@ def run_bot():
         all_events = fuzzy_deduplicate(all_events)
         print(f"Deduplikasyon sonrası: {len(all_events)} etkinlik")
 
-        # Separate new from seen — mark all as seen immediately
         new_events = [e for e in all_events if event_hash(e['title'], e['link']) not in seen]
-        for e in all_events:
-            seen.add(event_hash(e['title'], e['link']))
-
         print(f"Yeni etkinlik: {len(new_events)}")
 
         if not new_events:
             print("Yeni etkinlik bulunamadı.")
             save_seen_events(seen)
             return
+
+        # Flood guard: cap per run, leftovers stay unseen and go out next run
+        if len(new_events) > MAX_SENDS_PER_RUN:
+            print(f"[UYARI] {len(new_events)} yeni etkinlik, {MAX_SENDS_PER_RUN} ile sınırlandı")
+            new_events = new_events[:MAX_SENDS_PER_RUN]
+
+        # Mark attempted events as seen (even on send failure, to avoid spam loops)
+        for e in new_events:
+            seen.add(event_hash(e['title'], e['link']))
 
         # Categorize
         categorized = {cat: [] for cat in CATEGORY_MAP}
