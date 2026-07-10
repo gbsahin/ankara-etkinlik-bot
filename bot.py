@@ -7,7 +7,7 @@ import html as html_lib
 import time
 import signal
 import re
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
 
 # ─────────────────────────────────────────
@@ -16,11 +16,15 @@ from difflib import SequenceMatcher
 TOKEN            = os.getenv('TELEGRAM_TOKEN')
 CHAT_ID          = os.getenv('TELEGRAM_CHAT_ID')
 SEEN_EVENTS_FILE = "seen_events.json"
+EVENTS_DB_FILE   = "events_db.json"   # dated event archive, feeds the daily agenda
 
 MAX_RUN_SECONDS    = 480   # hard stop after 8 minutes
 MAX_OG_FETCHES     = 80    # max page/image fetches per run (covers all sources)
 FUZZY_THRESHOLD    = 0.82  # titles this similar → duplicate
 MAX_SENDS_PER_RUN  = 30    # flood guard: leftover events go out on the next run
+AGENDA_MAX_ITEMS   = 15    # max lines per agenda message
+
+TZ_TR = timezone(timedelta(hours=3))  # Europe/Istanbul (no DST)
 
 HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
@@ -78,6 +82,8 @@ SOURCE_STYLE = {
     "Mobilet":    {"icon": "🎭", "label": "Mobilet"},
     "ABB":        {"icon": "🏛", "label": "Ankara Büyükşehir"},
     "LaKonser":   {"icon": "🎵", "label": "LaKonser"},
+    "Bubilet":    {"icon": "🎤", "label": "Bubilet"},
+    "Biletino":   {"icon": "🎬", "label": "Biletino"},
 }
 
 
@@ -105,7 +111,7 @@ def cancel_global_timeout():
 
 
 # ─────────────────────────────────────────
-# Deduplication
+# Persistence
 # ─────────────────────────────────────────
 def load_seen_events():
     if os.path.exists(SEEN_EVENTS_FILE):
@@ -121,6 +127,36 @@ def save_seen_events(seen):
     with open(SEEN_EVENTS_FILE, "w") as f:
         json.dump(list(seen)[-2000:], f)
 
+def load_events_db():
+    if os.path.exists(EVENTS_DB_FILE):
+        try:
+            with open(EVENTS_DB_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data, dict):
+                    return data
+        except Exception:
+            pass
+    return {}
+
+def save_events_db(db):
+    """Prune past/stale entries, then persist."""
+    today = datetime.now(TZ_TR).strftime('%Y-%m-%d')
+    stale_cutoff = (datetime.now(TZ_TR) - timedelta(days=60)).strftime('%Y-%m-%d')
+    pruned = {}
+    for h, v in db.items():
+        date = v.get('date')
+        if date:
+            if date >= today:            # future or today → keep
+                pruned[h] = v
+        elif v.get('first_seen', '9999') >= stale_cutoff:  # undated: keep 60 days
+            pruned[h] = v
+    with open(EVENTS_DB_FILE, "w", encoding="utf-8") as f:
+        json.dump(pruned, f, ensure_ascii=False)
+
+
+# ─────────────────────────────────────────
+# Deduplication
+# ─────────────────────────────────────────
 def event_hash(title, link):
     clean_link = link.split("?")[0].rstrip("/").lower()
     return hashlib.md5(clean_link.encode()).hexdigest()
@@ -190,15 +226,9 @@ def og_image_from_soup(soup):
                 return img_url
     return None
 
-def get_og_image(url, fetch_counter=None):
-    page = fetch_page(url, fetch_counter, timeout=6)
-    if not page:
-        return None
-    return og_image_from_soup(BeautifulSoup(page, 'html.parser'))
-
 
 # ─────────────────────────────────────────
-# Location verification (JSON-LD schema.org)
+# Structured data (JSON-LD schema.org)
 # ─────────────────────────────────────────
 def jsonld_events(soup):
     """Yield schema.org Event dicts found in a page."""
@@ -232,6 +262,17 @@ def is_ankara_event_page(soup):
         loc_text = json.dumps(loc, ensure_ascii=False).lower()
         return any(hint in loc_text for hint in ANKARA_HINTS)
     return False  # no structured data → cannot verify → reject
+
+def extract_start_date(soup, link=''):
+    """Event start date as 'YYYY-MM-DD', from JSON-LD or the URL itself."""
+    for item in jsonld_events(soup):
+        sd = item.get('startDate')
+        if isinstance(sd, str) and re.match(r'\d{4}-\d{2}-\d{2}', sd):
+            return sd[:10]
+    m = re.search(r'/(\d{4}-\d{2}-\d{2})(?:/|$)', link)  # e.g. LaKonser URLs
+    if m:
+        return m.group(1)
+    return None
 
 
 # ─────────────────────────────────────────
@@ -310,7 +351,7 @@ TR_MONTHS = ["Ocak", "Şubat", "Mart", "Nisan", "Mayıs", "Haziran",
              "Temmuz", "Ağustos", "Eylül", "Ekim", "Kasım", "Aralık"]
 
 def turkish_date(dt=None):
-    dt = dt or datetime.now()
+    dt = dt or datetime.now(TZ_TR)
     return f"{dt.day:02d} {TR_MONTHS[dt.month - 1]} {dt.year}"
 
 def send_category_header(category, count):
@@ -345,7 +386,48 @@ def send_event(event):
 
 
 # ─────────────────────────────────────────
-# Scrapers
+# Daily agenda
+# ─────────────────────────────────────────
+def agenda_events_on(db, date_str):
+    evs = [v for v in db.values() if v.get('date') == date_str]
+    evs.sort(key=lambda v: v.get('title', ''))
+    return evs
+
+def build_agenda_text(header, events):
+    lines = [f"<b>{header}</b>"]
+    for e in events[:AGENDA_MAX_ITEMS]:
+        title = html_lib.escape(e['title'])
+        lines.append(f"• <a href=\"{e['link']}\">{title}</a> <i>({e.get('source', '')})</i>")
+    if len(events) > AGENDA_MAX_ITEMS:
+        lines.append(f"<i>… ve {len(events) - AGENDA_MAX_ITEMS} etkinlik daha</i>")
+    return "\n".join(lines)
+
+def send_agenda(db):
+    """Every morning: what's on in Ankara today. Fridays: weekend preview too."""
+    now = datetime.now(TZ_TR)
+    sections = []
+
+    today_evs = agenda_events_on(db, now.strftime('%Y-%m-%d'))
+    if today_evs:
+        sections.append((f"📅 Bugün Ankara'da · {turkish_date(now)}", today_evs))
+
+    if now.weekday() == 4:  # Friday → weekend preview
+        weekend = []
+        for d in (1, 2):
+            weekend.extend(agenda_events_on(db, (now + timedelta(days=d)).strftime('%Y-%m-%d')))
+        if weekend:
+            sections.append(("🎉 Bu Hafta Sonu Ankara'da", weekend))
+
+    for header, evs in sections:
+        send_text_message(build_agenda_text(header, evs))
+        time.sleep(0.8)
+    return len(sections)
+
+
+# ─────────────────────────────────────────
+# Scrapers — collect {title, link, source} only.
+# Event pages are fetched later, once, for NEW events only
+# (image + date extraction), which keeps runs fast.
 # ─────────────────────────────────────────
 def scrape_biletix(fetch_counter):
     events = []
@@ -377,9 +459,7 @@ def scrape_biletix(fetch_counter):
                     continue
                 seen_slugs.add(href)
                 link = href if href.startswith('http') else f"https://www.biletix.com{href}"
-                image = get_og_image(link, fetch_counter=fetch_counter)
-                time.sleep(0.3)
-                events.append({"title": title, "link": link, "source": "Biletix", "image": image})
+                events.append({"title": title, "link": link, "source": "Biletix"})
         except Exception as e:
             print(f"[Biletix Hata] {url}: {e}")
     print(f"Biletix: {len(events)} etkinlik")
@@ -404,11 +484,10 @@ def scrape_filankara(fetch_counter):
             if link in seen_links:
                 continue
             seen_links.add(link)
-            image = get_og_image(link, fetch_counter)
-            events.append({"title": title, "link": link, "source": "filAnkara", "image": image})
+            events.append({"title": title, "link": link, "source": "filAnkara"})
         if events:
             print(f"filAnkara: {events[0]['title']}")
-            return [events[0]]
+            return [events[0]]  # newsletter: only the latest issue
     except Exception as e:
         print(f"[filAnkara Hata] {e}")
     return events
@@ -482,10 +561,10 @@ def scrape_eventbrite(fetch_counter):
             if not is_ankara_event_page(soup):
                 skipped += 1
                 continue
-            image = og_image_from_soup(soup)
             time.sleep(0.2)
-            events.append({"title": c['title'], "link": c['link'],
-                           "source": "Eventbrite", "image": image})
+            events.append({"title": c['title'], "link": c['link'], "source": "Eventbrite",
+                           "image": og_image_from_soup(soup),
+                           "date": extract_start_date(soup, c['link'])})
         if skipped:
             print(f"[Eventbrite] {skipped} online/Ankara dışı etkinlik elendi")
     except Exception as e:
@@ -506,9 +585,7 @@ def scrape_biletinial(fetch_counter):
                 title = a.get_text(strip=True)
                 if title and len(title) > 4:
                     link = href if href.startswith('http') else f"https://www.biletinial.com{href}"
-                    image = get_og_image(link, fetch_counter)
-                    time.sleep(0.2)
-                    events.append({"title": title, "link": link, "source": "Biletinial", "image": image})
+                    events.append({"title": title, "link": link, "source": "Biletinial"})
     except Exception as e:
         print(f"[Biletinial Hata] {e}")
     print(f"Biletinial: {len(events)} etkinlik")
@@ -527,9 +604,7 @@ def scrape_biletimgo(fetch_counter):
                 title = a.get_text(strip=True)
                 if title and len(title) > 4:
                     link = href if href.startswith('http') else f"https://www.biletimgo.com{href}"
-                    image = get_og_image(link, fetch_counter)
-                    time.sleep(0.2)
-                    events.append({"title": title, "link": link, "source": "BiletimGO", "image": image})
+                    events.append({"title": title, "link": link, "source": "BiletimGO"})
     except Exception as e:
         print(f"[BiletimGO Hata] {e}")
     print(f"BiletimGO: {len(events)} etkinlik")
@@ -554,9 +629,7 @@ def scrape_mobilet(fetch_counter):
                     title = a.get_text(strip=True)
                     if title and len(title) > 4:
                         link = href if href.startswith('http') else f"https://mobilet.com{href}"
-                        image = get_og_image(link, fetch_counter)
-                        time.sleep(0.2)
-                        found.append({"title": title, "link": link, "source": "Mobilet", "image": image})
+                        found.append({"title": title, "link": link, "source": "Mobilet"})
             if found:
                 events = found
                 break
@@ -578,9 +651,7 @@ def scrape_abb(fetch_counter):
                 title = a.get_text(strip=True)
                 if title and len(title) > 4:
                     link = href if href.startswith('http') else f"https://www.ankara.bel.tr{href}"
-                    image = get_og_image(link, fetch_counter)
-                    time.sleep(0.2)
-                    events.append({"title": title, "link": link, "source": "ABB", "image": image})
+                    events.append({"title": title, "link": link, "source": "ABB"})
     except Exception as e:
         print(f"[ABB Hata] {e}")
     print(f"ABB: {len(events)} etkinlik")
@@ -599,13 +670,82 @@ def scrape_lakonser(fetch_counter):
                 title = a.get_text(strip=True)
                 if title and len(title) > 4:
                     link = href if href.startswith('http') else f"https://lakonser.com{href}"
-                    image = get_og_image(link, fetch_counter)
-                    time.sleep(0.2)
-                    events.append({"title": title, "link": link, "source": "LaKonser", "image": image})
+                    events.append({"title": title, "link": link, "source": "LaKonser"})
     except Exception as e:
         print(f"[LaKonser Hata] {e}")
     print(f"LaKonser: {len(events)} etkinlik")
     return events
+
+def scrape_bubilet(fetch_counter):
+    events = []
+    try:
+        page = fetch_page("https://www.bubilet.com.tr/ankara", timeout=15)
+        if not page:
+            return events
+        soup = BeautifulSoup(page, 'html.parser')
+        seen_links = set()
+        for a in soup.find_all('a', href=True):
+            href = a['href']
+            if '/ankara/etkinlik/' not in href:
+                continue
+            # 'title' attribute carries the clean event name on Bubilet
+            title = (a.get('title') or a.get_text(strip=True)).strip()
+            if not title or len(title) < 4:
+                continue
+            link = href if href.startswith('http') else f"https://www.bubilet.com.tr{href}"
+            clean = link.split('?')[0].rstrip('/')
+            if clean in seen_links:
+                continue
+            seen_links.add(clean)
+            events.append({"title": title, "link": link, "source": "Bubilet"})
+    except Exception as e:
+        print(f"[Bubilet Hata] {e}")
+    print(f"Bubilet: {len(events)} etkinlik")
+    return events
+
+def scrape_biletino(fetch_counter):
+    events = []
+    try:
+        page = fetch_page("https://biletino.com/tr/city/ankara/", timeout=15)
+        if not page:
+            return events
+        soup = BeautifulSoup(page, 'html.parser')
+        seen_links = set()
+        for a in soup.find_all('a', href=True):
+            href = a['href']
+            if not re.search(r'/tr/e-[a-z0-9]+/', href):
+                continue
+            title = a.get_text(strip=True)
+            if not title or len(title) < 4:
+                continue
+            link = href if href.startswith('http') else f"https://biletino.com{href}"
+            clean = link.split('?')[0].rstrip('/')
+            if clean in seen_links:
+                continue  # first anchor per event carries the clean title
+            seen_links.add(clean)
+            events.append({"title": title, "link": link, "source": "Biletino"})
+    except Exception as e:
+        print(f"[Biletino Hata] {e}")
+    print(f"Biletino: {len(events)} etkinlik")
+    return events
+
+
+# ─────────────────────────────────────────
+# Enrichment: fetch each NEW event's page once → image + date
+# ─────────────────────────────────────────
+def enrich_new_events(new_events, fetch_counter):
+    for e in new_events:
+        if 'image' in e or 'date' in e:
+            continue  # already enriched (Eventbrite)
+        page = fetch_page(e['link'], fetch_counter, timeout=6)
+        if page:
+            soup = BeautifulSoup(page, 'html.parser')
+            e['image'] = og_image_from_soup(soup)
+            e['date'] = extract_start_date(soup, e['link'])
+        else:
+            e['image'] = None
+            e['date'] = extract_start_date(BeautifulSoup('', 'html.parser'), e['link'])
+        time.sleep(0.3)
 
 
 # ─────────────────────────────────────────
@@ -618,17 +758,18 @@ def run_bot():
 
     set_global_timeout(MAX_RUN_SECONDS)
     seen = load_seen_events()
+    db = load_events_db()
 
     try:
-        print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M')}] Bot başlatılıyor...")
-        print(f"Daha önce görülen etkinlik: {len(seen)}")
+        print(f"[{datetime.now(TZ_TR).strftime('%Y-%m-%d %H:%M')}] Bot başlatılıyor...")
+        print(f"Daha önce görülen: {len(seen)} · Ajanda arşivi: {len(db)}")
 
         fetch_counter = {'count': 0}
         all_events = []
         for scraper in [
             scrape_filankara, scrape_biletix, scrape_eventbrite,
             scrape_biletinial, scrape_biletimgo, scrape_mobilet,
-            scrape_abb, scrape_lakonser
+            scrape_abb, scrape_lakonser, scrape_bubilet, scrape_biletino,
         ]:
             all_events.extend(scraper(fetch_counter))
 
@@ -639,43 +780,49 @@ def run_bot():
         new_events = [e for e in all_events if event_hash(e['title'], e['link']) not in seen]
         print(f"Yeni etkinlik: {len(new_events)}")
 
-        if not new_events:
-            print("Yeni etkinlik bulunamadı.")
-            save_seen_events(seen)
-            return
-
         # Flood guard: cap per run, leftovers stay unseen and go out next run
         if len(new_events) > MAX_SENDS_PER_RUN:
             print(f"[UYARI] {len(new_events)} yeni etkinlik, {MAX_SENDS_PER_RUN} ile sınırlandı")
             new_events = new_events[:MAX_SENDS_PER_RUN]
 
-        # Mark attempted events as seen (even on send failure, to avoid spam loops)
-        for e in new_events:
-            seen.add(event_hash(e['title'], e['link']))
-
-        # Categorize
-        categorized = {cat: [] for cat in CATEGORY_MAP}
-        for event in new_events:
-            categorized[classify_event(event['title'])].append(event)
-
-        # Send grouped by category
         sent_count = 0
-        for category, events in categorized.items():
-            if not events:
-                continue
-            send_category_header(category, len(events))
-            time.sleep(0.8)
-            for event in events:
-                if send_event(event):
-                    sent_count += 1
-                time.sleep(1.5)
+        if new_events:
+            enrich_new_events(new_events, fetch_counter)
+
+            today = datetime.now(TZ_TR).strftime('%Y-%m-%d')
+            for e in new_events:
+                h = event_hash(e['title'], e['link'])
+                # Mark as seen even on send failure, to avoid spam loops
+                seen.add(h)
+                db[h] = {"title": e['title'], "link": e['link'], "source": e['source'],
+                         "date": e.get('date'), "first_seen": today}
+
+            # Categorize and send
+            categorized = {cat: [] for cat in CATEGORY_MAP}
+            for event in new_events:
+                categorized[classify_event(event['title'])].append(event)
+
+            for category, events in categorized.items():
+                if not events:
+                    continue
+                send_category_header(category, len(events))
+                time.sleep(0.8)
+                for event in events:
+                    if send_event(event):
+                        sent_count += 1
+                    time.sleep(1.5)
+
+        # Daily agenda (independent of whether anything new was found)
+        agenda_sections = send_agenda(db)
 
         save_seen_events(seen)
-        print(f"Tamamlandı. {sent_count} etkinlik gönderildi.")
+        save_events_db(db)
+        print(f"Tamamlandı. {sent_count} yeni etkinlik, {agenda_sections} ajanda bölümü gönderildi.")
 
     except BotTimeoutError:
         print(f"[UYARI] {MAX_RUN_SECONDS}s sınırına ulaşıldı, kaydediliyor...")
         save_seen_events(seen)
+        save_events_db(db)
 
     finally:
         cancel_global_timeout()
