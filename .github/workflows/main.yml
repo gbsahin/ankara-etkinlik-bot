@@ -32,6 +32,6 @@ jobs:
           git stash
           git pull --rebase
           git stash pop || echo "Nothing to pop"
-          git add seen_events.json
+          git add seen_events.json events_db.json
           git commit -m "Update seen events" || echo "No changes"
           git push
